@@ -708,20 +708,15 @@ class SmartReadingGlassesApp:
 
             print(f"[INFO] OCR Completed: {word_count} words recognized ({conf:.1f}% confidence).")
 
-            # 2. IMMEDIATELY update UI on main thread with recognized text!
-            self.root.after(0, self._on_pipeline_success, text, word_count, conf)
-
-            # 3. Play speech audio asynchronously in background if TTS is enabled and words were found
-            if self.enable_tts and self.last_audio_file and word_count > 0:
-                print(f"[INFO] Speaking recognized text: {self.last_audio_file}")
-                play_audio_file(self.last_audio_file)
+            # 2. Visually update UI on main thread with recognized text FIRST!
+            self.root.after(0, self._on_pipeline_success, text, word_count, conf, self.last_audio_file)
 
         except Exception as e:
             traceback.print_exc()
             self.root.after(0, self._on_pipeline_error, str(e))
 
-    def _on_pipeline_success(self, text: str, word_count: int, confidence: float):
-        """Called on main thread when OCR succeeds."""
+    def _on_pipeline_success(self, text: str, word_count: int, confidence: float, audio_file: Optional[str] = None):
+        """Called on main thread when OCR succeeds. Renders text on screen FIRST, then speaks."""
         self.read_btn.config(text="📖  READ BOOK PAGE  [SPACE]", bg="#00a859", state=tk.NORMAL)
         self.is_processing = False
 
@@ -742,13 +737,28 @@ class SmartReadingGlassesApp:
                 fg="#ffaa00"
             )
         else:
+            # 1. DISPLAY TEXT ON SCREEN FIRST!
             self.text_box.delete("1.0", tk.END)
             self.text_box.insert(tk.END, text.strip())
             self.meta_lbl.config(text=f"{word_count} words | {confidence:.0f}% confidence", fg="#00e5ff")
             self.status_bar.config(
-                text=f"✔ COMPLETED — Reading {word_count} words aloud with {confidence:.0f}% confidence.",
-                fg="#00ff88"
+                text=f"✔ TEXT DISPLAYED ({word_count} words) — Preparing voice reading...",
+                fg="#00d4ff"
             )
+            # Force Tkinter to repaint the text box immediately before speaking starts
+            self.root.update_idletasks()
+
+            # 2. THEN BEGIN SPEECH AFTER TEXT IS VISIBLE (with natural reading pause)
+            if self.enable_tts and audio_file and os.path.exists(audio_file):
+                def _speak_after_display():
+                    # 350ms pause gives user time to see text appear on screen before voice speaks
+                    time.sleep(0.35)
+                    self.status_bar.config(
+                        text=f"🔊 READING ALOUD: {word_count} words ({confidence:.0f}% confidence)...",
+                        fg="#00ff88"
+                    )
+                    play_audio_file(audio_file)
+                threading.Thread(target=_speak_after_display, daemon=True).start()
 
     def _on_pipeline_error(self, err_msg: str):
         """Called on main thread when an error occurs."""
