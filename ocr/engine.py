@@ -175,22 +175,33 @@ class TesseractOCREngine:
             )
 
         try:
+            # Pass 1: Run OCR on primary preprocessed image with target PSM
             result = _run_tesseract(image, target_psm)
 
-            # If default PSM yielded low confidence or few words, try PSM 6 (uniform block of text)
-            if (result.mean_confidence < 65.0 or result.word_count < 8) and target_psm != 6:
+            # Pass 2: If default PSM yielded low confidence or few words, try PSM 6 (uniform block of text)
+            if (result.mean_confidence < 70.0 or result.word_count < 12) and target_psm != 6:
                 alt_result = _run_tesseract(image, 6)
-                if alt_result.mean_confidence > result.mean_confidence or (result.is_empty and not alt_result.is_empty):
+                score_curr = result.word_count * (result.mean_confidence / 100.0)
+                score_alt = alt_result.word_count * (alt_result.mean_confidence / 100.0)
+                if score_alt > score_curr:
                     result = alt_result
 
-            # If still low confidence or empty, and a fallback image (e.g. enhanced grayscale) was provided, try it!
-            if (result.is_empty or result.word_count < 5) and fallback_image is not None:
-                fb_result = _run_tesseract(fallback_image, 3)
-                if fb_result.word_count > result.word_count or fb_result.mean_confidence > result.mean_confidence:
+            # Pass 3: Evaluate CLAHE-enhanced grayscale if available
+            # Modern Tesseract LSTM often excels on grayscale by avoiding binary clipping
+            if fallback_image is not None:
+                score_curr = result.word_count * (result.mean_confidence / 100.0)
+                fb_result = _run_tesseract(fallback_image, target_psm)
+                fb_score = fb_result.word_count * (fb_result.mean_confidence / 100.0)
+
+                if fb_score > score_curr:
                     result = fb_result
-                elif fb_result.is_empty and target_psm != 6:
+                    score_curr = fb_score
+
+                # Also try PSM 6 on grayscale if still few words or low confidence
+                if (result.word_count < 12 or result.mean_confidence < 70.0):
                     fb_result6 = _run_tesseract(fallback_image, 6)
-                    if fb_result6.word_count > result.word_count:
+                    fb6_score = fb_result6.word_count * (fb_result6.mean_confidence / 100.0)
+                    if fb6_score > score_curr:
                         result = fb_result6
 
             return result

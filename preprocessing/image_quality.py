@@ -109,8 +109,8 @@ def detect_text_presence(gray_roi: np.ndarray) -> Tuple[bool, float, int]:
         if cv2.contourArea(c) > min_area and w >= h:
             text_blocks += 1
 
-    # Book page has character edge density between 2.5% and 40% and multiple text line blocks
-    is_text = (2.5 <= edge_density <= 45.0) and (text_blocks >= 2)
+    # Book page has character edge density between 1.5% and 50% and candidate text blocks
+    is_text = (1.5 <= edge_density <= 50.0) and (text_blocks >= 1)
     return is_text, edge_density, text_blocks
 
 def analyze_image_quality(image: np.ndarray) -> QualityReport:

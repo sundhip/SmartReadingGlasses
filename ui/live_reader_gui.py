@@ -65,17 +65,25 @@ class LiveCameraStream:
                 self._has_lores = False
 
             # Configure Camera Module 3 Autofocus:
-            # AfMode: 2 (Continuous)
-            # AfRange: 2 (Full: Macro 10cm to infinity for close-up books)
+            # AfMode: 2 (Continuous) or 1 (Auto)
+            # AfRange: 1 (Macro: 10cm to 50cm - strictly optimizes for book reading, avoids infinite hunting)
             # AfSpeed: 1 (Fast lens response)
             try:
+                from libcamera import controls
                 picam.set_controls({
-                    "AfMode": 2,
-                    "AfRange": 2,
-                    "AfSpeed": 1,
+                    "AfMode": controls.AfModeEnum.Continuous,
+                    "AfRange": controls.AfRangeEnum.Macro,
+                    "AfSpeed": controls.AfSpeedEnum.Fast,
                 })
             except Exception:
-                pass
+                try:
+                    picam.set_controls({
+                        "AfMode": 2,
+                        "AfRange": 1,
+                        "AfSpeed": 1,
+                    })
+                except Exception:
+                    pass
 
             picam.start()
             self._picam2 = picam
@@ -136,19 +144,50 @@ class LiveCameraStream:
         return None
 
     def trigger_autofocus(self):
-        """Forces an immediate fast autofocus cycle on Camera Module 3."""
+        """Forces an immediate fast macro autofocus lock on Camera Module 3."""
         if self._picam2:
             try:
-                self._picam2.set_controls({"AfTrigger": 0})
-                time.sleep(0.02)
+                from libcamera import controls
+                # Trigger single-shot PDAF sweep in Macro range (10cm - 50cm)
                 self._picam2.set_controls({
-                    "AfMode": 2,
-                    "AfRange": 2,
-                    "AfSpeed": 1,
-                    "AfTrigger": 1
+                    "AfMode": controls.AfModeEnum.Auto,
+                    "AfRange": controls.AfRangeEnum.Macro,
+                    "AfSpeed": controls.AfSpeedEnum.Fast,
+                    "AfTrigger": controls.AfTriggerEnum.Start
                 })
+                # Re-arm continuous tracking after 400ms
+                def _restore():
+                    time.sleep(0.4)
+                    try:
+                        self._picam2.set_controls({
+                            "AfMode": controls.AfModeEnum.Continuous,
+                            "AfRange": controls.AfRangeEnum.Macro,
+                            "AfSpeed": controls.AfSpeedEnum.Fast
+                        })
+                    except Exception:
+                        pass
+                threading.Thread(target=_restore, daemon=True).start()
             except Exception:
-                pass
+                try:
+                    self._picam2.set_controls({
+                        "AfMode": 1,
+                        "AfRange": 1,
+                        "AfSpeed": 1,
+                        "AfTrigger": 0
+                    })
+                    def _restore():
+                        time.sleep(0.4)
+                        try:
+                            self._picam2.set_controls({
+                                "AfMode": 2,
+                                "AfRange": 1,
+                                "AfSpeed": 1
+                            })
+                        except Exception:
+                            pass
+                    threading.Thread(target=_restore, daemon=True).start()
+                except Exception:
+                    pass
 
     def close(self):
         if self._picam2:
@@ -184,6 +223,7 @@ class SmartReadingGlassesApp:
         self.steady_start_time = None
         self.auto_read_cooldown = 0.0
         self.prev_gray_roi = None
+        self._last_af_trigger = 0.0
 
         self._build_ui()
         self._start_video_loop()
@@ -519,39 +559,50 @@ class SmartReadingGlassesApp:
 
                 cv2.rectangle(preview, (bx1, by1), (bx2, by2), box_color, 2)
 
-                # Hands-Free Auto-Read: triggers automatically when text is steady & sharp!
-                if self.auto_read_enabled.get() and not self.is_processing and now > self.auto_read_cooldown:
-                    if self.prev_gray_roi is not None:
-                        diff = cv2.absdiff(gray_roi, self.prev_gray_roi)
-                        motion = float(np.mean(diff))
+                # Auto-refocus trigger and Hands-Free Auto-Read
+                if self.prev_gray_roi is not None:
+                    # Apply Gaussian blur before differencing to eliminate CMOS sensor noise
+                    curr_blur = cv2.GaussianBlur(gray_roi, (5, 5), 0)
+                    prev_blur = cv2.GaussianBlur(self.prev_gray_roi, (5, 5), 0)
+                    diff = cv2.absdiff(curr_blur, prev_blur)
+                    motion = float(np.mean(diff))
 
-                        # Condition: Text detected + Sharp + Page held steady
-                        if has_text and sharpness >= QualityConfig.BLUR_THRESHOLD and motion < 4.0:
+                    # 1. Quick Auto-Refocus on Camera Module 3 when page is steady but focus is soft
+                    if motion < 5.0 and sharpness < 45.0 and (now - self._last_af_trigger) > 2.0:
+                        self._last_af_trigger = now
+                        self.stream.trigger_autofocus()
+
+                    # 2. Hands-Free Auto-Read: triggers automatically when text is steady & sharp!
+                    if self.auto_read_enabled.get() and not self.is_processing and now > self.auto_read_cooldown:
+                        is_steady = motion < 6.5
+                        is_sharp = sharpness >= 45.0
+
+                        if has_text and is_sharp and is_steady:
                             if self.steady_start_time is None:
                                 self.steady_start_time = now
                             elapsed = now - self.steady_start_time
 
-                            # Visual countdown progress bar on screen
-                            countdown_pct = min(1.0, elapsed / 0.85)
+                            # Visual countdown progress bar on screen (0.55s)
+                            countdown_pct = min(1.0, elapsed / 0.55)
                             bar_w = int((bx2 - bx1) * countdown_pct)
-                            cv2.rectangle(preview, (bx1, by2 - 14), (bx1 + bar_w, by2), (0, 255, 100), -1)
+                            cv2.rectangle(preview, (bx1, by2 - 16), (bx1 + bar_w, by2), (0, 255, 100), -1)
                             cv2.putText(
                                 preview,
-                                f"HOLD STEADY - AUTO-READ IN {max(0.0, 0.85 - elapsed):.1f}s",
-                                (bx1 + 10, by2 - 20),
+                                f"HOLD STEADY - READING IN {max(0.0, 0.55 - elapsed):.1f}s",
+                                (bx1 + 10, by2 - 22),
                                 cv2.FONT_HERSHEY_SIMPLEX,
-                                0.52,
+                                0.55,
                                 (0, 255, 100),
                                 2
                             )
 
-                            if elapsed >= 0.85:
+                            if elapsed >= 0.55:
                                 self.steady_start_time = None
-                                self.auto_read_cooldown = now + 4.5  # 4.5s cooldown before next page
+                                self.auto_read_cooldown = now + 4.0  # 4.0s cooldown before next page
                                 self.trigger_read_page()
                         else:
                             self.steady_start_time = None
-                    self.prev_gray_roi = gray_roi.copy()
+                self.prev_gray_roi = gray_roi.copy()
 
                 # Render frame onto Tkinter label
                 rgb = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
@@ -590,22 +641,27 @@ class SmartReadingGlassesApp:
 
     def _run_pipeline_worker(self, frame: np.ndarray):
         """Background worker thread to run OpenCV + Tesseract + TTS without blocking GUI."""
+        import traceback
         try:
+            print("[INFO] Initiating page capture and recognition...")
+            INPUT_DIR.mkdir(parents=True, exist_ok=True)
+            snapshot_path = INPUT_DIR / "camera_live_capture.jpg"
+
             # Crop to the focused reading guide box if enabled (removes desk/fingers)
             if self.crop_to_guide.get():
                 h, w = frame.shape[:2]
-                bx1, by1 = int(w * 0.12), int(h * 0.12)
-                bx2, by2 = int(w * 0.88), int(h * 0.88)
+                bx1, by1 = int(w * 0.10), int(h * 0.10)
+                bx2, by2 = int(w * 0.90), int(h * 0.90)
                 ocr_frame = frame[by1:by2, bx1:bx2]
             else:
                 ocr_frame = frame
 
-            snapshot_path = INPUT_DIR / "camera_live_capture.jpg"
             cv2.imwrite(str(snapshot_path), ocr_frame)
 
+            # 1. Run pipeline with play_audio=False so recognized text displays immediately!
             result = self.pipeline.run_on_image(
                 snapshot_path,
-                play_audio=True,
+                play_audio=False,
                 save_audio=True,
                 binarization_method=self.method
             )
@@ -613,15 +669,39 @@ class SmartReadingGlassesApp:
             text = result.cleaned_text.cleaned_text
             word_count = result.ocr.word_count
             conf = result.ocr.mean_confidence
-            self.last_audio_file = result.audio_file_path
+            self.last_audio_file = result.audio_path
 
-            # Update UI on main thread
+            # If guide crop yielded 0 words, auto-fallback to full uncropped frame
+            if (word_count == 0 or not text.strip()) and self.crop_to_guide.get():
+                print("[INFO] Guide crop yielded 0 words. Retrying with full uncropped frame...")
+                cv2.imwrite(str(snapshot_path), frame)
+                result = self.pipeline.run_on_image(
+                    snapshot_path,
+                    play_audio=False,
+                    save_audio=True,
+                    binarization_method=self.method
+                )
+                text = result.cleaned_text.cleaned_text
+                word_count = result.ocr.word_count
+                conf = result.ocr.mean_confidence
+                self.last_audio_file = result.audio_path
+
+            print(f"[INFO] OCR Completed: {word_count} words recognized ({conf:.1f}% confidence).")
+
+            # 2. IMMEDIATELY update UI on main thread with recognized text!
             self.root.after(0, self._on_pipeline_success, text, word_count, conf)
+
+            # 3. Play speech audio asynchronously in background if TTS is enabled and words were found
+            if self.enable_tts and self.last_audio_file and word_count > 0:
+                print(f"[INFO] Speaking recognized text: {self.last_audio_file}")
+                play_audio_file(self.last_audio_file)
+
         except Exception as e:
+            traceback.print_exc()
             self.root.after(0, self._on_pipeline_error, str(e))
 
     def _on_pipeline_success(self, text: str, word_count: int, confidence: float):
-        """Called on main thread when OCR + TTS succeeds."""
+        """Called on main thread when OCR succeeds."""
         self.read_btn.config(text="📖  READ BOOK PAGE  [SPACE]", bg="#00a859", state=tk.NORMAL)
         self.is_processing = False
 
@@ -629,14 +709,14 @@ class SmartReadingGlassesApp:
             help_msg = (
                 "[No clear text recognized on this page]\n\n"
                 "Helpful tips:\n"
-                "• Position the book page inside the green guide box.\n"
-                "• Press [F] or click '🎯 REFOCUS' to lock sharp focus on the printed words.\n"
-                "• Ensure standard room lighting without deep shadows.\n"
+                "• Position the book page inside the green guide box (approx. 20-30 cm from camera).\n"
+                "• Press [F] or click '🎯 REFOCUS' to lock sharp macro focus on the printed words.\n"
+                "• Ensure standard room lighting without harsh glare or deep shadows.\n"
                 "• Press [SPACE] to capture and read again."
             )
             self.text_box.delete("1.0", tk.END)
             self.text_box.insert(tk.END, help_msg)
-            self.meta_lbl.config(text="0 words | 0% conf")
+            self.meta_lbl.config(text="0 words | 0% conf", fg="#ffaa00")
             self.status_bar.config(
                 text="⚠ No text detected. Check lighting, press [F] to Refocus, and press [SPACE] again.",
                 fg="#ffaa00"
@@ -644,17 +724,29 @@ class SmartReadingGlassesApp:
         else:
             self.text_box.delete("1.0", tk.END)
             self.text_box.insert(tk.END, text.strip())
-            self.meta_lbl.config(text=f"{word_count} words | {confidence:.0f}% confidence")
+            self.meta_lbl.config(text=f"{word_count} words | {confidence:.0f}% confidence", fg="#00e5ff")
             self.status_bar.config(
-                text=f"✔ COMPLETED — Read {word_count} words aloud with {confidence:.0f}% confidence.",
+                text=f"✔ COMPLETED — Reading {word_count} words aloud with {confidence:.0f}% confidence.",
                 fg="#00ff88"
             )
 
     def _on_pipeline_error(self, err_msg: str):
         """Called on main thread when an error occurs."""
-        self.status_bar.config(text=f"✖ ERROR: {err_msg[:60]}", fg="#ff4444")
+        self.status_bar.config(text=f"✖ ERROR: {err_msg[:80]}", fg="#ff4444")
         self.read_btn.config(text="📖  READ BOOK PAGE  [SPACE]", bg="#00a859", state=tk.NORMAL)
         self.is_processing = False
+
+        err_display = (
+            f"[Error During Page Processing]\n\n"
+            f"Details: {err_msg}\n\n"
+            "Troubleshooting Steps:\n"
+            "1. Tesseract OCR missing: Open terminal on Raspberry Pi and run:\n"
+            "   sudo apt install -y tesseract-ocr tesseract-ocr-eng\n"
+            "2. Camera Module 3: Ensure ribbon cable is seated firmly in CAM/DISP 0.\n"
+            "3. Try pressing [SPACE] again or click '📖 READ BOOK PAGE'."
+        )
+        self.text_box.delete("1.0", tk.END)
+        self.text_box.insert(tk.END, err_display)
 
     def replay_audio(self):
         """Replays the last spoken audio file through the speakers."""

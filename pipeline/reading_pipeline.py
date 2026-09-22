@@ -39,6 +39,11 @@ class PipelineResult:
     timings: Dict[str, float] = field(default_factory=dict)
     total_time: float = 0.0
 
+    @property
+    def audio_file_path(self) -> Optional[str]:
+        """Backward-compatible alias for audio_path."""
+        return self.audio_path
+
     def summary(self) -> str:
         """Formats an executive summary of the pipeline execution."""
         lines = [

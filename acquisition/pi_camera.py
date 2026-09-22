@@ -108,16 +108,26 @@ class RaspberryPiCamera:
             picam.configure(camera_config)
             picam.start()
 
-            # Warmup and autofocus trigger
+            # Warmup and autofocus trigger: Macro range (10cm-50cm) prevents hunting to infinity
             if self.autofocus:
                 try:
+                    from libcamera import controls
                     picam.set_controls({
-                        "AfMode": 2,       # Continuous autofocus
-                        "AfRange": 2,      # Full range (includes Macro down to 10cm for books)
-                        "AfSpeed": 1,      # Fast autofocus response
+                        "AfMode": controls.AfModeEnum.Auto,
+                        "AfRange": controls.AfRangeEnum.Macro,
+                        "AfSpeed": controls.AfSpeedEnum.Fast,
+                        "AfTrigger": controls.AfTriggerEnum.Start,
                     })
                 except Exception:
-                    pass
+                    try:
+                        picam.set_controls({
+                            "AfMode": 1,       # Auto single-shot focus lock
+                            "AfRange": 1,      # Macro range (10cm - 50cm for books)
+                            "AfSpeed": 1,      # Fast autofocus response
+                            "AfTrigger": 0,    # Trigger AF scan
+                        })
+                    except Exception:
+                        pass
             time.sleep(self.warmup_seconds)
 
             image = picam.capture_array()
@@ -156,7 +166,7 @@ class RaspberryPiCamera:
         if self.autofocus:
             cmd.extend([
                 "--autofocus-mode", "auto",
-                "--autofocus-range", "full",
+                "--autofocus-range", "macro",
                 "--autofocus-speed", "fast"
             ])
 

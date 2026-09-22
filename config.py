@@ -51,8 +51,8 @@ class QualityConfig:
     LOW_CONTRAST_THRESHOLD = 30.0
     
     # Sharpness / Blur metric (Laplacian variance)
-    # Variance < 80 generally indicates motion or out-of-focus blur on text
-    BLUR_THRESHOLD = 80.0
+    # Variance < 50 indicates noticeable motion blur; >= 50 is sharp for book text
+    BLUR_THRESHOLD = 50.0
     
     # Maximum recommended skew angle before warning (degrees)
     MAX_RECOMMENDED_SKEW_DEG = 15.0
