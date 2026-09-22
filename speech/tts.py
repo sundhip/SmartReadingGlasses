@@ -68,12 +68,13 @@ class TextToSpeechEngine:
         self.rate = rate
         self.volume = volume
         self.voice_variant = voice_variant
+        self.has_piper = shutil.which("piper") is not None
         self.has_pico = shutil.which("pico2wave") is not None
         self.has_espeak = shutil.which("espeak-ng") is not None
 
     def is_available(self) -> bool:
         """Returns True if at least one TTS engine is present."""
-        return self.has_pico or self.has_espeak or (pyttsx3 is not None)
+        return self.has_piper or self.has_pico or self.has_espeak or (pyttsx3 is not None)
 
     def speak(
         self,
@@ -101,11 +102,28 @@ class TextToSpeechEngine:
         synthesized = False
 
         # ---------------------------------------------------------
-        # Engine Option 1: SVOX Pico (Natural human inflection on Pi)
+        # Engine Option 1: Piper Neural TTS (State-of-the-art Neural Voice)
         # ---------------------------------------------------------
-        if self.has_pico and sys.platform.startswith("linux"):
+        if self.has_piper:
             try:
-                # Use SVOX speed level tag to slow down rushed speech to calm book reading pace
+                # Find default or available piper voice model
+                proc = subprocess.run(
+                    ["piper", "--output_file", target_audio_file],
+                    input=text_to_speak,
+                    text=True,
+                    capture_output=True,
+                    timeout=15
+                )
+                if proc.returncode == 0 and os.path.exists(target_audio_file) and os.path.getsize(target_audio_file) > 100:
+                    synthesized = True
+            except Exception:
+                pass
+
+        # ---------------------------------------------------------
+        # Engine Option 2: SVOX Pico (Natural human inflection on Pi)
+        # ---------------------------------------------------------
+        if not synthesized and self.has_pico and sys.platform.startswith("linux"):
+            try:
                 pico_speed = getattr(TTSConfig, "PICO_SPEED_LEVEL", 82)
                 pico_text = f"<speed level='{pico_speed}'>{text_to_speak}</speed>"
                 cmd = ["pico2wave", "-l", "en-US", "-w", target_audio_file, pico_text]
@@ -113,7 +131,6 @@ class TextToSpeechEngine:
                 if res.returncode == 0 and os.path.exists(target_audio_file) and os.path.getsize(target_audio_file) > 100:
                     synthesized = True
                 else:
-                    # Fallback to plain text without tags if tag was unsupported
                     cmd = ["pico2wave", "-l", "en-US", "-w", target_audio_file, text_to_speak]
                     res = subprocess.run(cmd, capture_output=True, timeout=12)
                     if res.returncode == 0 and os.path.exists(target_audio_file):

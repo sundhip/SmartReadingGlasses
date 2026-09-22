@@ -174,14 +174,15 @@ class SmartReadingGlassesApp:
         self.method = method
         self.enable_tts = enable_tts
         self.pipeline = ReadingPipeline(enable_tts=enable_tts)
-        self.stream = LiveCameraStream(width=640, height=480)
+        self.stream = LiveCameraStream(preview_width=640, preview_height=480, capture_width=1920, capture_height=1080)
 
         self.is_processing = False
-        self.auto_read_enabled = tk.BooleanVar(value=False)
+        self.auto_read_enabled = tk.BooleanVar(value=True)
         self.crop_to_guide = tk.BooleanVar(value=True)
         self.speed_var = tk.StringVar(value="Calm (120 WPM)")
         self.last_audio_file = None
         self.steady_start_time = None
+        self.auto_read_cooldown = 0.0
         self.prev_gray_roi = None
 
         self._build_ui()
@@ -473,6 +474,8 @@ class SmartReadingGlassesApp:
 
     def _start_video_loop(self):
         """Pulls camera frames and updates viewfinder display in Tkinter mainloop."""
+        from preprocessing.image_quality import detect_text_presence
+
         def update_frame():
             if not self.root.winfo_exists():
                 return
@@ -488,32 +491,63 @@ class SmartReadingGlassesApp:
                 gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
                 sharpness = cv2.Laplacian(gray_roi, cv2.CV_64F).var()
 
-                if sharpness >= QualityConfig.BLUR_THRESHOLD:
-                    self.focus_lbl.config(
-                        text=f"Focus: {sharpness:.0f} [SHARP & READY]",
-                        fg="#00ff88"
-                    )
-                    box_color = (0, 255, 0)
-                else:
-                    self.focus_lbl.config(
-                        text=f"Focus: {sharpness:.0f} [PRESS F TO REFOCUS]",
-                        fg="#ffaa00"
-                    )
-                    box_color = (0, 165, 255)
+                # Detect if printed text is present in the viewing area
+                has_text, edge_density, text_blocks = detect_text_presence(gray_roi)
 
                 preview = frame.copy()
+                now = time.time()
+
+                # Dynamic focus & text detection feedback
+                if has_text and sharpness >= QualityConfig.BLUR_THRESHOLD:
+                    self.focus_lbl.config(
+                        text=f"Focus: {sharpness:.0f} [TEXT IN VIEW | SHARP & READY]",
+                        fg="#00ff88"
+                    )
+                    box_color = (0, 255, 0)  # Green
+                elif has_text:
+                    self.focus_lbl.config(
+                        text=f"Focus: {sharpness:.0f} [TEXT IN VIEW | FOCUSING...]",
+                        fg="#ffaa00"
+                    )
+                    box_color = (0, 165, 255)  # Orange
+                else:
+                    self.focus_lbl.config(
+                        text=f"Focus: {sharpness:.0f} [AIM AT PRINTED BOOK PAGE]",
+                        fg="#8888aa"
+                    )
+                    box_color = (120, 120, 120)  # Gray
+
                 cv2.rectangle(preview, (bx1, by1), (bx2, by2), box_color, 2)
 
-                # Auto-read check
-                if self.auto_read_enabled.get() and not self.is_processing:
+                # Hands-Free Auto-Read: triggers automatically when text is steady & sharp!
+                if self.auto_read_enabled.get() and not self.is_processing and now > self.auto_read_cooldown:
                     if self.prev_gray_roi is not None:
                         diff = cv2.absdiff(gray_roi, self.prev_gray_roi)
-                        motion = np.mean(diff)
-                        if motion < 3.0 and sharpness >= QualityConfig.BLUR_THRESHOLD:
+                        motion = float(np.mean(diff))
+
+                        # Condition: Text detected + Sharp + Page held steady
+                        if has_text and sharpness >= QualityConfig.BLUR_THRESHOLD and motion < 4.0:
                             if self.steady_start_time is None:
-                                self.steady_start_time = time.time()
-                            elif time.time() - self.steady_start_time >= 1.6:
+                                self.steady_start_time = now
+                            elapsed = now - self.steady_start_time
+
+                            # Visual countdown progress bar on screen
+                            countdown_pct = min(1.0, elapsed / 0.85)
+                            bar_w = int((bx2 - bx1) * countdown_pct)
+                            cv2.rectangle(preview, (bx1, by2 - 14), (bx1 + bar_w, by2), (0, 255, 100), -1)
+                            cv2.putText(
+                                preview,
+                                f"HOLD STEADY - AUTO-READ IN {max(0.0, 0.85 - elapsed):.1f}s",
+                                (bx1 + 10, by2 - 20),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.52,
+                                (0, 255, 100),
+                                2
+                            )
+
+                            if elapsed >= 0.85:
                                 self.steady_start_time = None
+                                self.auto_read_cooldown = now + 4.5  # 4.5s cooldown before next page
                                 self.trigger_read_page()
                         else:
                             self.steady_start_time = None
