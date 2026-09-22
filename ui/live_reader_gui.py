@@ -22,6 +22,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import cv2
 import numpy as np
+import collections
 from PIL import Image, ImageTk
 
 from pipeline.reading_pipeline import ReadingPipeline
@@ -224,6 +225,7 @@ class SmartReadingGlassesApp:
         self.auto_read_cooldown = 0.0
         self.prev_gray_roi = None
         self._last_af_trigger = 0.0
+        self.best_shot_buffer = collections.deque(maxlen=10)
 
         self._build_ui()
         self._start_video_loop()
@@ -446,8 +448,8 @@ class SmartReadingGlassesApp:
 
         tk.Label(
             text_hdr,
-            text="RECOGNIZED BOOK TEXT",
-            font=("Helvetica", 10, "bold"),
+            text="📖 RECOGNIZED TEXT  [Google Tesseract LSTM | 360° Auto-Straighten]",
+            font=("Helvetica", 9, "bold"),
             fg="#00d4ff",
             bg="#202028"
         ).pack(side=tk.LEFT)
@@ -455,7 +457,7 @@ class SmartReadingGlassesApp:
         self.meta_lbl = tk.Label(
             text_hdr,
             text="0 words | 0% conf",
-            font=("Helvetica", 9),
+            font=("Helvetica", 9, "bold"),
             fg="#9090aa",
             bg="#202028"
         )
@@ -537,6 +539,9 @@ class SmartReadingGlassesApp:
                 preview = frame.copy()
                 now = time.time()
 
+                # Store frame in Rolling Best-Shot Buffer for motion blur immunity
+                self.best_shot_buffer.append((sharpness, frame.copy()))
+
                 # Dynamic focus & text detection feedback
                 if has_text and sharpness >= QualityConfig.BLUR_THRESHOLD:
                     self.focus_lbl.config(
@@ -568,27 +573,27 @@ class SmartReadingGlassesApp:
                     motion = float(np.mean(diff))
 
                     # 1. Quick Auto-Refocus on Camera Module 3 when page is steady but focus is soft
-                    if motion < 5.0 and sharpness < 45.0 and (now - self._last_af_trigger) > 2.0:
+                    if motion < 5.0 and sharpness < 42.0 and (now - self._last_af_trigger) > 2.0:
                         self._last_af_trigger = now
                         self.stream.trigger_autofocus()
 
-                    # 2. Hands-Free Auto-Read: triggers automatically when text is steady & sharp!
+                    # 2. Hands-Free Fast Auto-Read: triggers in only 0.25s (no need to hold still for long!)
                     if self.auto_read_enabled.get() and not self.is_processing and now > self.auto_read_cooldown:
-                        is_steady = motion < 6.5
-                        is_sharp = sharpness >= 45.0
+                        is_steady = motion < 7.5
+                        is_sharp = sharpness >= 40.0
 
                         if has_text and is_sharp and is_steady:
                             if self.steady_start_time is None:
                                 self.steady_start_time = now
                             elapsed = now - self.steady_start_time
 
-                            # Visual countdown progress bar on screen (0.55s)
-                            countdown_pct = min(1.0, elapsed / 0.55)
+                            # Visual countdown progress bar on screen (0.25s snappy trigger)
+                            countdown_pct = min(1.0, elapsed / 0.25)
                             bar_w = int((bx2 - bx1) * countdown_pct)
                             cv2.rectangle(preview, (bx1, by2 - 16), (bx1 + bar_w, by2), (0, 255, 100), -1)
                             cv2.putText(
                                 preview,
-                                f"HOLD STEADY - READING IN {max(0.0, 0.55 - elapsed):.1f}s",
+                                f"HOLD STEADY - AUTO-READ IN {max(0.0, 0.25 - elapsed):.2f}s",
                                 (bx1 + 10, by2 - 22),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.55,
@@ -596,9 +601,9 @@ class SmartReadingGlassesApp:
                                 2
                             )
 
-                            if elapsed >= 0.55:
+                            if elapsed >= 0.25:
                                 self.steady_start_time = None
-                                self.auto_read_cooldown = now + 4.0  # 4.0s cooldown before next page
+                                self.auto_read_cooldown = now + 3.5  # 3.5s cooldown before next page
                                 self.trigger_read_page()
                         else:
                             self.steady_start_time = None
@@ -617,12 +622,27 @@ class SmartReadingGlassesApp:
         self.root.after(50, update_frame)
 
     def trigger_read_page(self, captured_frame: Optional[np.ndarray] = None):
-        """Triggers the full pipeline using high-resolution sensor capture."""
+        """Triggers the full pipeline using best-shot stabilized high-resolution capture."""
         if self.is_processing:
             return
 
-        # Capture high-resolution frame (1080p) for accurate OCR
-        frame = captured_frame if captured_frame is not None else self.stream.capture_highres_frame()
+        # 1. High-resolution sensor capture
+        frame = captured_frame
+        if frame is None:
+            frame = self.stream.capture_highres_frame()
+
+        # 2. Best-Shot Stabilization: If current frame has motion blur or failed, select sharpest buffer frame
+        if self.best_shot_buffer:
+            best_cached_sharpness, best_cached_frame = max(self.best_shot_buffer, key=lambda item: item[0])
+            if frame is None:
+                frame = best_cached_frame
+            else:
+                curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                curr_sharpness = cv2.Laplacian(curr_gray, cv2.CV_64F).var()
+                # If current shot caught a hand-shake or blur, use best clear frame from buffer
+                if curr_sharpness < 35.0 and best_cached_sharpness > 45.0:
+                    frame = best_cached_frame
+
         if frame is None:
             frame = self.stream.read_preview_frame()
 
@@ -633,7 +653,7 @@ class SmartReadingGlassesApp:
         self.is_processing = True
         self.read_btn.config(text="⏳ READING PAGE...", bg="#d97706", state=tk.DISABLED)
         self.status_bar.config(
-            text="● PROCESSING: Enhancing image, recognizing text with Tesseract, generating speech...",
+            text="● PROCESSING: 360° Auto-Straightening, Google Tesseract LSTM, generating speech...",
             fg="#ffaa00"
         )
 

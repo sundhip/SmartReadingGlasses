@@ -33,27 +33,93 @@ def resize_for_ocr(image: np.ndarray, max_dim: int = PreprocessConfig.MAX_IMAGE_
     resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
     return resized, True
 
+def auto_orient_360(gray: np.ndarray) -> Tuple[np.ndarray, int]:
+    """
+    Detects 0, 90, 180, or 270 degree rotational misalignment using Tesseract OSD.
+    Rotates the page right-side up automatically so the user never needs to hold it straight.
+    """
+    try:
+        import pytesseract
+        # Fast downscale for OSD to keep orientation check under 100ms
+        h, w = gray.shape[:2]
+        if max(h, w) > 800:
+            scale = 800.0 / float(max(h, w))
+            osd_input = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        else:
+            osd_input = gray
+
+        osd = pytesseract.image_to_osd(osd_input, output_type=pytesseract.Output.DICT)
+        rotate_deg = int(osd.get("rotate", 0))
+        conf = float(osd.get("orientation_conf", 0.0))
+
+        if conf >= 3.0 and rotate_deg in (90, 180, 270):
+            if rotate_deg == 90:
+                rotated = cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)
+            elif rotate_deg == 180:
+                rotated = cv2.rotate(gray, cv2.ROTATE_180)
+            elif rotate_deg == 270:
+                rotated = cv2.rotate(gray, cv2.ROTATE_90_COUNTERCLOCKWISE)
+            else:
+                rotated = gray
+            return rotated, rotate_deg
+    except Exception:
+        pass
+    return gray, 0
+
 def deskew_image(gray: np.ndarray) -> Tuple[np.ndarray, float]:
-    """Detects angle of text lines and rotates the image straight."""
-    thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    coords = np.column_stack(np.where(thresh > 0))
-    if len(coords) < 100:
+    """
+    Detects precise text line tilt angle (-45 to +45 degrees) using morphological
+    horizontal line grouping and contour orientation.
+    Works even on handheld tilted books!
+    """
+    h, w = gray.shape[:2]
+    # Invert binary so text is white
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+
+    # Dilate horizontally to connect characters into horizontal lines
+    k_w = max(20, int(w * 0.03))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k_w, 3))
+    dilated = cv2.dilate(thresh, kernel, iterations=1)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    angles = []
+    min_area = (w * h) * 0.0003
+
+    for c in contours:
+        if cv2.contourArea(c) > min_area:
+            rect = cv2.minAreaRect(c)
+            (cx, cy), (rw, rh), angle = rect
+            if rw < rh:
+                rw, rh = rh, rw
+                angle = angle + 90.0
+            while angle > 45.0:
+                angle -= 90.0
+            while angle < -45.0:
+                angle += 90.0
+            if rw > 2.0 * rh and abs(angle) <= 45.0:
+                angles.append(angle)
+
+    if len(angles) >= 3:
+        target_angle = float(np.median(angles))
+    else:
+        # Fallback to whole-page minAreaRect
+        coords = np.column_stack(np.where(thresh > 0))
+        if len(coords) > 100:
+            rect = cv2.minAreaRect(coords)
+            angle = rect[-1]
+            if angle < -45:
+                angle = -(90 + angle)
+            elif angle > 45:
+                angle = 90 - angle
+            target_angle = float(angle)
+        else:
+            target_angle = 0.0
+
+    if abs(target_angle) < 0.5:
         return gray, 0.0
 
-    rect = cv2.minAreaRect(coords)
-    angle = rect[-1]
-
-    if angle < -45:
-        angle = -(90 + angle)
-    elif angle > 45:
-        angle = 90 - angle
-
-    if abs(angle) < 0.5 or abs(angle) > 40.0:
-        return gray, 0.0
-
-    (h, w) = gray.shape[:2]
     center = (w // 2, h // 2)
-    rotation_matrix = cv2.getRotationMatrix2D(center, angle, 1.0)
+    rotation_matrix = cv2.getRotationMatrix2D(center, target_angle, 1.0)
     deskewed = cv2.warpAffine(
         gray,
         rotation_matrix,
@@ -61,7 +127,7 @@ def deskew_image(gray: np.ndarray) -> Tuple[np.ndarray, float]:
         flags=cv2.INTER_CUBIC,
         borderMode=cv2.BORDER_REPLICATE
     )
-    return deskewed, angle
+    return deskewed, target_angle
 
 def preprocess_for_ocr(
     image: np.ndarray,
@@ -102,11 +168,17 @@ def preprocess_for_ocr(
     else:
         gray = working_img.copy()
 
-    # 3. Deskewing
+    # 3. 360-Degree Auto-Orientation & Text-Line Straightening
     if deskew:
+        # Check 90, 180, 270 degree rotation first
+        gray, rot_deg = auto_orient_360(gray)
+        if rot_deg != 0:
+            report.applied_steps.append(f"Auto-oriented upright by {rot_deg} degrees (OSD)")
+
+        # Fine text-line tilt leveling (-45 to +45 degrees)
         gray, angle = deskew_image(gray)
         if abs(angle) >= 0.5:
-            report.applied_steps.append(f"Deskewed by {angle:.2f} degrees")
+            report.applied_steps.append(f"Deskewed text lines by {angle:.2f} degrees")
 
     # 4. Contrast Enhancement (CLAHE)
     if enhance_contrast:
